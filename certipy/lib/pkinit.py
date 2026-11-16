@@ -23,6 +23,7 @@ from asn1crypto import cms as asn1cms
 from asn1crypto import keys as asn1keys
 from asn1crypto import x509 as asn1x509
 from impacket.krb5 import constants
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from certipy.lib.certificate import (
     cert_to_der,
@@ -148,77 +149,76 @@ class DirtyDH:
 
 def sign_authpack(
     data: bytes,
-    key: rsa.RSAPrivateKey,
+    key: Union[rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey],
     cert: Union[x509.Certificate, asn1x509.Certificate],
 ) -> bytes:
     """
     Create a signed CMS structure containing the AuthPack.
-
-    Args:
-        data: The AuthPack data to sign
-        key: RSA private key for signing
-        cert: Certificate to include in the signed data
-
-    Returns:
-        ASN.1 DER encoded CMS signed data
     """
-    # Convert certificate to asn1crypto format if needed
     if isinstance(cert, x509.Certificate):
         cert = asn1x509.Certificate.load(cert_to_der(cert))
 
-    # Create digest algorithm identifier for SHA-1
-    digest_algorithm = {"algorithm": asn1algos.DigestAlgorithmId("sha1")}
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        # Pick a hash matching the curve's security level
+        hash_by_curve_size = {256: hashes.SHA256, 384: hashes.SHA384, 521: hashes.SHA512}
+        hash_algorithm = hash_by_curve_size.get(key.curve.key_size, hashes.SHA256)
+        sig_algo_name = {
+            hashes.SHA256: "sha256_ecdsa",
+            hashes.SHA384: "sha384_ecdsa",
+            hashes.SHA512: "sha512_ecdsa",
+        }[hash_algorithm]
+        digest_algo_name = {
+            hashes.SHA256: "sha256",
+            hashes.SHA384: "sha384",
+            hashes.SHA512: "sha512",
+        }[hash_algorithm]
+    else:
+        hash_algorithm = hashes.SHA1
+        sig_algo_name = "sha1_rsa"
+        digest_algo_name = "sha1"
 
-    # Create signer info
+    digest_algorithm = {"algorithm": asn1algos.DigestAlgorithmId(digest_algo_name)}
+
     signer_info = {
         "version": "v1",
         "sid": asn1cms.IssuerAndSerialNumber(
-            {
-                "issuer": cert.issuer,
-                "serial_number": cert.serial_number,
-            }
+            {"issuer": cert.issuer, "serial_number": cert.serial_number}
         ),
         "digest_algorithm": asn1algos.DigestAlgorithm(digest_algorithm),
         "signed_attrs": [
             asn1cms.CMSAttribute({"type": "content_type", "values": [PKINIT_OID]}),
             asn1cms.CMSAttribute(
-                {"type": "message_digest", "values": [hash_digest(data, hashes.SHA1)]}
+                {"type": "message_digest", "values": [hash_digest(data, hash_algorithm)]}
             ),
         ],
-        "signature_algorithm": asn1algos.SignedDigestAlgorithm(
-            {"algorithm": "sha1_rsa"}
-        ),
+        "signature_algorithm": asn1algos.SignedDigestAlgorithm({"algorithm": sig_algo_name}),
         "signature": bytes(),
     }
 
-    # Create the signature
-    signer_info["signature"] = rsa_pkcs1v15_sign(
-        asn1cms.CMSAttributes(signer_info["signed_attrs"]).dump(),
-        key,
-        hash_algorithm=hashes.SHA1,
-    )
+    signed_attrs_der = asn1cms.CMSAttributes(signer_info["signed_attrs"]).dump()
 
-    # Create encapsulated content info
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        signer_info["signature"] = key.sign(signed_attrs_der, ec.ECDSA(hash_algorithm()))
+    else:
+        signer_info["signature"] = rsa_pkcs1v15_sign(
+            signed_attrs_der, key, hash_algorithm=hash_algorithm
+        )
+
     encapsulated_content_info = {"content_type": PKINIT_OID, "content": data}
 
-    # Create the signed data structure
     signed_data = {
         "version": "v3",
         "digest_algorithms": [asn1algos.DigestAlgorithm(digest_algorithm)],
-        "encap_content_info": asn1cms.EncapsulatedContentInfo(
-            encapsulated_content_info
-        ),
+        "encap_content_info": asn1cms.EncapsulatedContentInfo(encapsulated_content_info),
         "certificates": [cert],
         "signer_infos": asn1cms.SignerInfos([asn1cms.SignerInfo(signer_info)]),
     }
 
-    # Create the content info wrapper
     content_info = {
         "content_type": CMS_SIGNED_DATA_OID,
         "content": asn1cms.SignedData(signed_data),
     }
 
-    # Return DER-encoded ContentInfo
     return asn1cms.ContentInfo(content_info).dump()
 
 
